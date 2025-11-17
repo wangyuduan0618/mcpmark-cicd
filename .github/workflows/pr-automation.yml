@@ -1,0 +1,379 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+  security-events: write
+  checks: read
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        id: install_deps_cq
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          elif [ -f package.json ]; then
+            npm install || true
+          fi
+      - name: Run ESLint
+        id: run_eslint
+        continue-on-error: true
+        run: |
+          if [ -f package.json ] && jq -re '.scripts.lint' package.json >/dev/null 2>&1; then
+            npm run lint
+          else
+            npx --yes eslint .
+          fi
+      - name: Run Prettier check
+        id: run_prettier
+        continue-on-error: true
+        run: |
+          npx --yes prettier --check .
+      - name: Build Code Quality summary
+        id: summarize_code_quality
+        run: |
+          ESLINT_STATUS="${{ steps.run_eslint.outcome }}"
+          PRETTIER_STATUS="${{ steps.run_prettier.outcome }}"
+          {
+            echo "summary<<'EOF'";
+            echo "### Code Quality Report";
+            echo "";
+            echo "- ESLint: ${ESLINT_STATUS}";
+            echo "- Prettier: ${PRETTIER_STATUS}";
+            echo "";
+            echo "Details:";
+            echo "ESLint command: if npm script exists then 'npm run lint' else 'npx eslint .'";
+            echo "Prettier command: 'npx prettier --check .'";
+            echo "EOF";
+          } >> "$GITHUB_OUTPUT"
+      - name: Comment PR with Code Quality Report
+        id: comment_code_quality
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('No PR found in context'); return; }
+            const body = `${{ toJSON(steps.summarize_code_quality.outputs.summary) }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body
+            });
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        id: install_deps_tests
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          elif [ -f package.json ]; then
+            npm install || true
+          fi
+      - name: Run tests with coverage if available
+        id: run_tests
+        continue-on-error: true
+        run: |
+          set +e
+          COVERAGE_DIR="coverage"
+          mkdir -p "$COVERAGE_DIR"
+          if [ -f package.json ] && jq -re '.scripts.test' package.json >/dev/null 2>&1; then
+            # Try with coverage flags first, then fallback
+            npm test -- --coverage || npm test || true
+          else
+            # Try common test runners
+            npx --yes jest --coverage || npx --yes vitest run --coverage || npm test || true
+          fi
+          # Attempt to find coverage summary
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "Found coverage-summary.json"
+          elif [ -f coverage/lcov.info ]; then
+            echo "Found lcov.info"
+          else
+            # Try to create lcov from nyc if available
+            if command -v npx >/dev/null 2>&1; then
+              npx --yes nyc report --reporter=lcov --report-dir=coverage || true
+            fi
+          fi
+      - name: Generate Test Coverage summary text
+        id: parse_coverage
+        run: |
+          set +e
+          summaryFile="coverage/coverage-summary.json"
+          if [ -f "$summaryFile" ]; then
+            LINES=$(jq -r '.total.lines.pct // empty' "$summaryFile")
+            STMTS=$(jq -r '.total.statements.pct // empty' "$summaryFile")
+            FUNCS=$(jq -r '.total.functions.pct // empty' "$summaryFile")
+            BRANCHES=$(jq -r '.total.branches.pct // empty' "$summaryFile")
+          fi
+          if [ -z "$LINES" ] && [ -f coverage/lcov.info ]; then
+            # Fallback: compute rough line coverage from lcov
+            TOTAL_LINES=$(grep -h "LF:" coverage/lcov.info | awk -F: '{s+=$2} END {print s+0}')
+            COV_LINES=$(grep -h "LH:" coverage/lcov.info | awk -F: '{s+=$2} END {print s+0}')
+            if [ "$TOTAL_LINES" -gt 0 ]; then
+              LINES=$(awk -v c=$COV_LINES -v t=$TOTAL_LINES 'BEGIN { printf "%.2f", (c/t)*100 }')
+            fi
+          fi
+          {
+            echo "summary<<'EOF'";
+            echo "### Test Coverage Report";
+            echo "";
+            if [ -n "$LINES$STMTS$FUNCS$BRANCHES" ]; then
+              [ -n "$LINES" ] && echo "- Lines: ${LINES}%" || true;
+              [ -n "$STMTS" ] && echo "- Statements: ${STMTS}%" || true;
+              [ -n "$FUNCS" ] && echo "- Functions: ${FUNCS}%" || true;
+              [ -n "$BRANCHES" ] && echo "- Branches: ${BRANCHES}%" || true;
+            else
+              echo "No coverage data could be generated. Tests may be missing or not configured to output coverage.";
+            fi
+            echo "";
+            echo "Artifacts include any available coverage outputs.";
+            echo "EOF";
+          } >> "$GITHUB_OUTPUT"
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/**
+            **/lcov.info
+          if-no-files-found: ignore
+      - name: Comment PR with Test Coverage Report
+        id: comment_coverage
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('No PR found in context'); return; }
+            const body = `${{ toJSON(steps.parse_coverage.outputs.summary) }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body
+            });
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies (for audit)
+        id: install_deps_security
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          elif [ -f package.json ]; then
+            npm install || true
+          fi
+      - name: Run npm audit
+        id: npm_audit
+        continue-on-error: true
+        run: |
+          npm audit --audit-level=low --json > audit.json || true
+          # Try legacy if necessary
+          if [ ! -s audit.json ]; then
+            npm audit --json > audit.json || true
+          fi
+          echo "Wrote audit.json"
+      - name: Parse vulnerabilities summary
+        id: parse_vulns
+        run: |
+          set +e
+          LOW=0; MOD=0; HIGH=0; CRIT=0
+          if jq -e . audit.json >/dev/null 2>&1; then
+            # npm v8+ format
+            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="low") ] | length' audit.json 2>/dev/null)
+            MOD=$(jq '[.vulnerabilities[]? | select(.severity=="moderate") ] | length' audit.json 2>/dev/null)
+            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="high") ] | length' audit.json 2>/dev/null)
+            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="critical") ] | length' audit.json 2>/dev/null)
+            TOTAL=$(jq '.metadata.vulnerabilities.total // (.vulnerabilities|length) // 0' audit.json 2>/dev/null)
+          fi
+          {
+            echo "summary<<'EOF'";
+            echo "### Security Scan Report";
+            echo "";
+            echo "- Dependencies Vulnerabilities (TOTAL: ${TOTAL:-0}):";
+            echo "  - Critical: ${CRIT}";
+            echo "  - High: ${HIGH}";
+            echo "  - Moderate: ${MOD}";
+            echo "  - Low: ${LOW}";
+            echo "";
+            echo "- Secrets Scan: See 'gitleaks-report' artifact for details.";
+            echo "";
+            echo "Notes: This report includes Vulnerabilities from Dependencies via npm audit and secret scanning via gitleaks.";
+            echo "EOF";
+          } >> "$GITHUB_OUTPUT"
+      - name: Gitleaks secrets scan
+        id: gitleaks_scan
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2.3.4
+        with:
+          args: --source . --redact --report-format sarif --report-path gitleaks.sarif
+      - name: Upload security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            audit.json
+            gitleaks.sarif
+          if-no-files-found: ignore
+      - name: Comment PR with Security Scan Report
+        id: comment_security
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('No PR found in context'); return; }
+            const body = `${{ toJSON(steps.parse_vulns.outputs.summary) }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body
+            });
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        id: install_deps_build
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci || npm install
+          elif [ -f package.json ]; then
+            npm install || true
+          fi
+      - name: Build application
+        id: build_app
+        continue-on-error: true
+        run: |
+          if [ -f package.json ] && jq -re '.scripts.build' package.json >/dev/null 2>&1; then
+            npm run build
+          else
+            echo "No build script found, skipping build step."; exit 0
+          fi
+      - name: Attempt to start application (background)
+        id: start_app
+        continue-on-error: true
+        run: |
+          set +e
+          if [ -f package.json ] && jq -re '.scripts.start' package.json >/dev/null 2>&1; then
+            npm run start &
+            echo $! > app.pid
+            # Wait for common dev ports
+            npx --yes wait-on -t 20000 tcp:3000 || npx --yes wait-on -t 20000 tcp:8080 || true
+          else
+            echo "No start script found, skipping runtime validation."
+          fi
+      - name: Validate endpoints
+        id: validate_endpoints
+        continue-on-error: true
+        run: |
+          set +e
+          STATUS_MSG=""
+          if [ -f app.pid ]; then
+            for URL in http://localhost:3000 http://localhost:8080; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$URL" || echo "000")
+              if [ "$CODE" != "000" ]; then
+                STATUS_MSG+="Endpoint ${URL} responded with HTTP ${CODE}\n"
+              else
+                STATUS_MSG+="Endpoint ${URL} not reachable\n"
+              fi
+            done
+          else
+            STATUS_MSG="Application not started; no endpoints validated."
+          fi
+          printf "%b" "$STATUS_MSG" > endpoint-status.txt
+      - name: Stop application
+        id: stop_app
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill $(cat app.pid) || true
+          fi
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-preview
+          path: |
+            dist/**
+            build/**
+            out/**
+            endpoint-status.txt
+          if-no-files-found: warn
+      - name: Comment PR with Build Validation
+        id: comment_build
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('No PR found in context'); return; }
+            const buildOutcome = `${{ steps.build_app.outcome }}`;
+            const started = `${{ steps.start_app.outcome }}`;
+            const fs = require('fs');
+            let status = '';
+            try { status = fs.readFileSync('endpoint-status.txt', 'utf8'); } catch (e) {}
+            const body = [
+              '### Build Validation',
+              '',
+              `- Build step: ${buildOutcome}`,
+              `- Start step: ${started}`,
+              '',
+              'Endpoint checks:',
+              '```',
+              status || 'No endpoint status available.',
+              '```'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body
+            });
